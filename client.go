@@ -20,6 +20,7 @@ import (
 	"os/user"
 	"path"
 	"path/filepath"
+	"strings"
 )
 
 const version = 32
@@ -53,16 +54,23 @@ type Client struct {
 }
 
 // NewClient establishes a connection to the PulseAudio server.
-func NewClient(addressArr ...string) (*Client, error) {
-	if len(addressArr) < 1 {
+func NewClient(serverAddr string) (*Client, error) {
+	if serverAddr == "" {
 		rtp, err := RuntimePath("native")
 		if err != nil {
 			return nil, err
 		}
-		addressArr = []string{rtp}
+		serverAddr = rtp
 	}
 
-	conn, err := net.Dial("unix", addressArr[0])
+	network := "unix"
+	// checking if pulseaudio is a remote server (used for local development with wsl)
+	if strings.HasPrefix(serverAddr, "tcp:") {
+		network = "tcp"
+		serverAddr = serverAddr[4:]
+	}
+
+	conn, err := net.Dial(network, serverAddr)
 	if err != nil {
 		return nil, err
 	}
