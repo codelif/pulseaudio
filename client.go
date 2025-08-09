@@ -21,6 +21,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 const version = 32
@@ -40,6 +41,34 @@ type Error struct {
 	Code uint32
 }
 
+// Event is a decoded subscription event from PulseAudio.
+type Event struct {
+	RawType  uint32 // full t
+	Facility uint32 // RawType & FacilityMask
+	Op       uint32 // RawType & TypeMask
+	Index    uint32 // affected object index
+}
+
+const (
+	// Facilities (low nibble)
+	EvSink         = 0x0000
+	EvSource       = 0x0001
+	EvSinkInput    = 0x0002
+	EvSourceOutput = 0x0003
+	EvModule       = 0x0004
+	EvClient       = 0x0005
+	EvSampleCache  = 0x0006
+	EvServer       = 0x0007
+	EvCard         = 0x0009
+	FacilityMask   = 0x000F
+
+	// Operations (bits 4..5)
+	EvNew    = 0x0000
+	EvChange = 0x0010
+	EvRemove = 0x0020
+	TypeMask = 0x0030
+)
+
 func (err *Error) Error() string {
 	return fmt.Sprintf("PulseAudio error: %s -> %s", err.Cmd, errors[err.Code])
 }
@@ -50,7 +79,11 @@ type Client struct {
 	clientIndex int
 	packets     chan packet
 	updates     chan struct{}
+	events      chan Event
 	connected   bool
+	subscribed  bool
+	subMask     uint32
+	subMu       sync.Mutex
 }
 
 // NewClient establishes a connection to the PulseAudio server.
@@ -79,6 +112,7 @@ func NewClient(serverAddr string) (*Client, error) {
 		conn:      conn,
 		packets:   make(chan packet),
 		updates:   make(chan struct{}, 1),
+		events:    make(chan Event, 64),
 		connected: true,
 	}
 
@@ -179,6 +213,20 @@ loop:
 				panic(err)
 			}
 			if rsp == commandSubscribeEvent && tag == 0xffffffff {
+				var t, idx uint32
+				if err := bread(buff, uint32Tag, &t, uint32Tag, &idx); err == nil {
+					evt := Event{
+						RawType:  t,
+						Facility: t & FacilityMask,
+						Op:       t & TypeMask,
+						Index:    idx,
+					}
+					select {
+					case c.events <- evt:
+					default:
+					} // drop if full
+				}
+				// Optional: still tick the legacy channel
 				select {
 				case c.updates <- struct{}{}:
 				default:
@@ -218,7 +266,6 @@ loop:
 	// end of packet processing loop, e.g. disconnected
 	c.connected = false
 	for _, p := range pending {
-
 		p.responseChan <- packetResponse{
 			buff: nil,
 			err:  fmt.Errorf("PulseAudio client was closed"),
@@ -228,7 +275,8 @@ loop:
 
 func (c *Client) request(cmd command, args ...interface{}) (*bytes.Buffer, error) {
 	var b bytes.Buffer
-	args = append([]interface{}{uint32(0), // dummy length -- we'll overwrite at the end when we know our final length
+	args = append([]interface{}{
+		uint32(0),            // dummy length -- we'll overwrite at the end when we know our final length
 		uint32(0xffffffff),   // channel
 		uint32(0), uint32(0), // offset high & low
 		uint32(0),              // flags
@@ -353,7 +401,6 @@ func (c *Client) Connected() bool {
 // Original implementation: https://github.com/pulseaudio/pulseaudio/blob/6c58c69bb6b937c1e758410d3114fc3bc0606fbe/src/pulsecore/core-util.c
 // Except we do not support legacy $HOME paths
 func RuntimePath(fn string) (string, error) {
-
 	if rtp := os.Getenv("PULSE_RUNTIME_PATH"); rtp != "" {
 		return filepath.Join(rtp, fn), nil
 	}
@@ -373,7 +420,6 @@ func RuntimePath(fn string) (string, error) {
 }
 
 func cookiePath() (string, error) {
-
 	p := filepath.Join(os.Getenv("PULSE_COOKIE"))
 	if exists(p) {
 		return p, nil
